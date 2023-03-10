@@ -2330,9 +2330,10 @@ class Room(object):
                 if self.simulator_state["air_abs_needed"]:
 
                     # EDITED BY DAAN IN CODE
-                    for band in rir_bands:
-                        band[fdl2: N + fdl2] *= air_decay[:N]
-
+                    if len(rir_bands) == 1:
+                        rir_bands[0][fdl2 : N + 2 * fdl2 + 1] *= air_decay[:(N + fdl2 + 1)]
+                    
+                    # Original code
                     # # In case this was not multi-band, do the band pass filtering
                     # if len(rir_bands) == 1:
                     #     rir_bands = self.octave_bands.analysis(rir_bands[0]).T
