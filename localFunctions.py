@@ -2,20 +2,28 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.io.wavfile import write
 from scipy.signal import chirp, spectrogram, find_peaks, firwin, filtfilt, hilbert, resample
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, least_squares
+from scipy.spatial import Delaunay
 import librosa as lbr
 import scipy as sp
 from numpy.linalg import inv
-from scipy import signal
 import plotly.graph_objects as go
-import numba
-from numba import jit, vectorize
-import soundfile as sf
 import samplerate
 from scipy.io import wavfile
-from shapely.geometry import Polygon
-from shapely import Point
+from shapely.geometry import Polygon, Point
+from pyroomacoustics.directivities import (
+    DirectivityPattern,
+    DirectionVector,
+    CardioidFamily
+)
+import copy
+from collections import defaultdict
+import math
 import json
+import itertools
+import random
+import numba
+from numba import jit
 with open('config.json') as json_file:
     config = json.load(json_file)
 
@@ -95,13 +103,15 @@ def create_location_grid_non_shoebox(vertices, height, distance_boundary, nx, ny
     :param nz: amount of z positions in grid
     :return: grid of coordinates
     """
+    azi = 0
+    coalt = 0
 
     polygon = Polygon(vertices)
     inner_polygon = polygon.buffer(-distance_boundary)
     bounding_box = inner_polygon.bounds
 
     out_count = 0
-    all_positions = np.empty((1, 3))
+    all_positions = np.empty((1, 5))
 
     x_min, y_min, x_max, y_max = bounding_box
     speaker_x_coords = np.linspace(x_min, x_max, nx)
@@ -109,18 +119,21 @@ def create_location_grid_non_shoebox(vertices, height, distance_boundary, nx, ny
     speaker_z_coords = np.linspace(distance_boundary, height - distance_boundary, nz)
     x_pos, y_pos, z_pos = np.meshgrid(speaker_x_coords, speaker_y_coords, speaker_z_coords)
     x_pos_flatten, y_pos_flatten, z_pos_flatten = x_pos.flatten(), y_pos.flatten(), z_pos.flatten()
-    grid = np.array([x_pos_flatten, y_pos_flatten, z_pos_flatten]).T
+    # make grid and add directivity
+    n_dir_obj = np.size(x_pos_flatten)
+    azi_array = np.repeat(azi, n_dir_obj)
+    coalt_array = np.repeat(coalt, n_dir_obj)
+    grid = np.array([x_pos_flatten, y_pos_flatten, z_pos_flatten, azi_array, coalt_array]).T
 
     for position in range (0, np.size(grid, axis=0)):
-        x, y , z = grid[position][0], grid[position][1], grid[position][2]
+        x, y , z, azi, coalt = grid[position][0], grid[position][1], grid[position][2], grid[position][3], grid[position][4]
         point = Point(x, y)
 
         # Returns True if the boundary or interior of the object
         # intersect in any way with those of the other.
         if inner_polygon.intersects(point):
             # Point is inside the shape
-            # Generate a random Z coördinate
-            coord = np.array([x, y, z])
+            coord = np.array([x, y, z, azi, coalt])
             all_positions = np.vstack((all_positions, coord))
 
         else:
@@ -212,11 +225,13 @@ def create_random_positions_in_random_3D_space(vertices, height, distance_bounda
     :param n_points: amount of datapoints to generate
     :return:
     """
+    azi = 0
+    coalt = 0
     polygon = Polygon(vertices)
     inner_polygon = polygon.buffer(-distance_boundary)
     bounding_box = inner_polygon.bounds
 
-    all_positions = np.empty((1,3))
+    all_positions = np.empty((1,5))
     out_count = 0
     while np.size(all_positions, axis=0)-1<n_points:
         x_min, y_min, x_max, y_max = bounding_box
@@ -230,7 +245,7 @@ def create_random_positions_in_random_3D_space(vertices, height, distance_bounda
             # Point is inside the shape
             # Generate a random Z coördinate
             z = np.random.uniform(distance_boundary, height-distance_boundary)
-            coord = np.array([x, y, z])
+            coord = np.array([x, y, z, azi, coalt])
             all_positions = np.vstack((all_positions, coord))
 
         else:
@@ -382,19 +397,21 @@ def plot_RIR(title, rir, fs):
 #     plt.xlabel('Time [s]')
 #     plt.show()
 
-def loopRIRplot(path_rirs, position_nr, fs_source):
+def loopRIRplot(path_rirs, sim_nr, fs_source, n_mics, n_speakers):
     """
     Loop over rirs and plot them
     :param path_Rirs: location of rir files
     :param position_nr: position number
     :param fs_source: source sample frequency
+    :param n_mics: amount of mics to loop
+    :param n_speakers: amount of speakers to loop
     :return: plot of the rirs
     """
-    for rx in range(config['n_mics']):
-        for sp in range(config['n_speakers']):
-            rir = np.load(path_rirs + "rir" + str(sp) + "source" + str(rx) + "mic_position" + str(position_nr) + ".npy")
-            plot_RIR(title="RIR at the " + str(rx) + "th mic from the " + str(sp) + "th speaker, position " +
-                           str(position_nr), rir=rir, fs=fs_source)
+    for rx in range(n_mics):
+        for sp in range(n_speakers):
+            rir = np.load(path_rirs + "rir" + str(sp) + "source" + str(rx) + "mic_position" + str(sim_nr) + ".npy")
+            plot_RIR(title="RIR at the " + str(rx) + "th mic from the " + str(sp) + "th speaker, simulation " +
+                           str(sim_nr), rir=rir, fs=fs_source)
 
 
 def plot_corr(title, corr, x_fit, y_fit):
@@ -611,22 +628,22 @@ def downsample_LPF(signal, n_samples):
     return signal_down
 
 
-def create_rx_audio_matrix(path_audio, position_nr):
+def create_rx_audio_matrix(path_audio, sim_nr, n_mics, n_speakers):
     '''
     create matrix with all the received audio fragments for 1 position
     :param n_mics: amount om microphones
     :param n_speakers: amount of speakers
     :param path_audio: path to audio wav files
-    :param position_nr: number of the position
+    :param sim_nr: number of the simulation
     :return:
     '''
     # get length of mic signal
-    sig, fs_mic = lbr.load(path_audio + "Received_signal_of_the_0th_mic_from_0th_source_position_"+str(position_nr)+".wav", sr=None)
+    sig, fs_mic = lbr.load(path_audio + "Received_signal_of_the_0th_mic_from_0th_source_simulation_"+str(sim_nr)+".wav", sr=None)
     rx_mic_sig = np.empty(np.size(sig))
 
-    for rx in range(config['n_mics']):
-        for sp in range(config['n_speakers']):
-            rx_mic_path = path_audio + "Received_signal_of_the_"+str(rx)+"th_mic_from_"+str(sp)+"th_source_position_"+str(position_nr)+".wav"
+    for rx in range(n_mics):
+        for sp in range(n_speakers):
+            rx_mic_path = path_audio + "Received_signal_of_the_"+str(rx)+"th_mic_from_"+str(sp)+"th_source_simulation_"+str(sim_nr)+".wav"
             # Read observed/received signal
             sig_mic, _ = lbr.load(rx_mic_path, sr=None)  # preserve native sampling rate of file via sr = None
             rx_mic_sig = np.vstack((rx_mic_sig, sig_mic))
@@ -635,28 +652,45 @@ def create_rx_audio_matrix(path_audio, position_nr):
     # Plot the received audio signals
     index = 0
     if config['plot_audio']:
-        for rx in range(config['n_mics']):
-            for sp in range(config['n_speakers']):
+        for rx in range(n_mics):
+            for sp in range(n_speakers):
                 signal = np.array(rx_mic_sig[index,:])
-                plot_audio_signal(title="RX signal at the "+str(rx)+"th mic from the "+str(sp)+"th speaker, position "+str(position_nr),
+                plot_audio_signal(title="RX signal at the "+str(rx)+"th mic from the "+str(sp)+"th speaker, simulation "+str(sim_nr),
                                   signal=signal, fs=fs_mic, dur_orig_sig=config['chirp_duration'], delay=0)
                 index += 1
 
     return rx_mic_sig
 
-def add_AWGN(rx_mic_sig, snr, position_nr, fs_mic, path_audio_awgn):
+def get_closest_speaker_mic_match(rx_locs, sp_loc):
+    """
+    Given a matrix with microphone locations and a speaker location return the closest pair
+    :param rx_locs: matrix microphone locations
+    :param sp_loc: speaker location
+    :return: index of closest match
+    """
+    distances = np.linalg.norm(rx_locs-sp_loc, axis=1)
+    index_closest_match = np.argmin(distances)
+
+    return index_closest_match
+
+def add_AWGN(rx_mic_sig, snr, sim_nr, fs_mic, path_audio_awgn, closest_mic_to_speaker, n_mics, n_speakers):
     """
     Add AWGN to received microphone signals defined for mic 0 and interpolated to others
     :param rx_mic_sig: matrix with received microphone values
     :param snr: snr value in dB
-    :param position_nr: number of observed position
+    :param sim_nr: number of observed simulation
     :param fs_mic: sample frequency at microphone
     :param path_audio_awgn: path to save awgn audio
+    :param closest_mic_to_speaker: the index of the microphone that is closest to the speaker for that specific
+    :param n_mics: number of microphones in set
+    :param n_speakers: number of speakers in set
     :return: matrix with mic signals with AWGN, SNR value  per mic
     """
     # https://medium.com/analytics-vidhya/adding-noise-to-audio-clips-5d8cee24ccb8
+    # Get microphone signal closest to the speaker to define the SNR
+
     # SNR = 10 log (RMS_signal^2/RMS_noise^2)
-    awgn = create_AWGN(rx_mic_sig[0, :], snr)
+    awgn = create_AWGN(rx_mic_sig[closest_mic_to_speaker, :], snr)
     rx_mic_sig = rx_mic_sig + awgn
 
     # Get back SNR values at every microphone
@@ -665,33 +699,33 @@ def add_AWGN(rx_mic_sig, snr, position_nr, fs_mic, path_audio_awgn):
     index = 0
 
     # plot and save
-    for rx in range(config['n_mics']):
-        for sp in range(config['n_speakers']):
+    for rx in range(n_mics):
+        for sp in range(n_speakers):
             signal = np.array(rx_mic_sig[index, :])
             if config['plot_audio']:
                 plot_audio_signal(
-                    title="RX signal at the " + str(rx) + "th mic from the " + str(sp) + "th speaker, position " + str(
-                        position_nr) + " with AWGN",
+                    title="RX signal at the " + str(rx) + "th mic from the " + str(sp) + "th speaker, simulation " + str(
+                        sim_nr) + " with AWGN",
                     signal=signal, fs=fs_mic, dur_orig_sig=config['chirp_duration'], delay=0)
             index += 1
             if config['save_rx_audio_with_noise']:
-                wavfile.write(path_audio_awgn + 'Received_audio_with_awgn_mic' + str(rx) + '_speaker_' + str(sp) + 'position' + str(position_nr) + '.wav', rate=fs_mic, data=signal.astype(np.int16))
+                wavfile.write(path_audio_awgn + 'Received_audio_with_awgn_mic' + str(rx) + '_speaker_' + str(sp) + 'simulation' + str(sim_nr) + '.wav', rate=fs_mic, data=signal.astype(np.int16))
 
     return rx_mic_sig, SNR_val
 
-def add_interference(interference_signal, SIR, rx_mic_sig, fs_mic, position_nr, path_audio_sir):
+def add_interference(interference_signal, SIR, rx_mic_sig, fs_mic, sim_nr, path_audio_sir, closest_mic_to_speaker_index, n_mics, n_speakers):
     """
     Add interference signal to audio
     :param interference_signal: the interference signal
     :param SIR: the SIR value in dB
     :param rx_mic_sig: the received microphone signals
     :param fs_mic: sample frequency at microphone
-    :param position_nr: position number
+    :param sim_nr: simulation number
     :param path_audio_sir: path to save audio files
     :return: rx_mic_sig: matrix with audio files with SIR
     """
     # safe blank first received to calculate SIR later
-    first_blanc = rx_mic_sig[0, :]
+    first_blanc = rx_mic_sig[closest_mic_to_speaker_index, :]
 
     # Read audio file of interference noise
     sound_in, fs_in = lbr.load(interference_signal, sr=None)
@@ -707,17 +741,17 @@ def add_interference(interference_signal, SIR, rx_mic_sig, fs_mic, position_nr, 
 
     index = 0
 
-    for rx in range(config['n_mics']):
-        for sp in range(config['n_speakers']):
+    for rx in range(n_mics):
+        for sp in range(n_speakers):
             signal = np.array(rx_mic_sig[index, :])
             if config['plot_audio']:
                 plot_audio_signal(
-                    title="RX signal at the " + str(rx) + "th mic from the " + str(sp) + "th speaker, position " + str(position_nr)
+                    title="RX signal at the " + str(rx) + "th mic from the " + str(sp) + "th speaker, simulation " + str(sim_nr)
                           + " with AWGN and interference noise",
                     signal=signal, fs=fs_mic, dur_orig_sig=config['chirp_duration'], delay=0)
             index += 1
             wavfile.write(path_audio_sir + 'Received_audio_with_awgn_and_interf_mic' + str(rx) + '_speaker_' + str(
-                sp) + 'position' + str(position_nr) + '.wav', rate=fs_mic, data=signal.astype(np.int16))
+                sp) + 'simulation' + str(sim_nr) + '.wav', rate=fs_mic, data=signal.astype(np.int16))
 
     return rx_mic_sig
 
@@ -831,7 +865,7 @@ def resample_source_to_mic(fs_source, fs_mic, chirp_orig):
     else:  # in the sample rates are identical, no up/down sampling is required
         chirp_orig_resampl = chirp_orig
 
-    np.save('chirp_orig_not_or_resampled.npy', chirp_orig_resampl)
+    np.save('Sim_data\\chirp_orig_not_or_resampled.npy', chirp_orig_resampl)
 
     return chirp_orig_resampl
 
@@ -1091,6 +1125,52 @@ def estimate_xyz_GaussNewton(S, N, r):
 
 plt.rcParams['axes.unicode_minus'] = False
 
+def LS_positioning(anchor_positions, distances, x0):
+    """
+    Least Squares positioning estimate. Minimise the difference in measured distance to anchor point and estimated distances to do positioning
+    :param anchor_positions: e.g. np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0.5, 0.5, 0.5]])
+    :param distances: e.g. np.array([1.5, 1.3, 1.2, 1.4, 0.7])
+    :param x0: Initial guess for the position of the point e.g. np.array([0.5, 0.5, 0.5])
+    :return: the estimated position
+    """
+    # Define the function to minimize
+    def minimise_function_LS(x, anchor_positions, distances):
+        # Calculate the squared differences between the estimated distances and the actual distances
+        return np.sqrt(np.sum((np.linalg.norm(anchor_positions - x, axis=1) - distances) ** 2))
+    # Call the least squares optimizer
+    res = least_squares(minimise_function_LS, x0, args=(anchor_positions, distances))
+    return res.x
+
+def calc_inv_surface(x, y):
+    """
+    Given x and y values calculate the surface above the line and between y = 1
+    :param x: x values list
+    :param y: y values list
+    :return: surface value
+    """
+    dx = np.diff(x)
+    invy = np.array(y[:-1])
+    one_array = np.ones(np.size(invy))
+    dy = one_array - invy
+    surface_area = np.sum(dx*dy)
+    return surface_area
+
+def get_CDF_inverse_surface(sorted_error_values):
+    """
+    Determine the upper left surface area of a CDF function
+    :param sorted_error_values: sorted x_value parameters
+    :return: surface_area value
+    """
+    p = 1. * np.arange(len(sorted_error_values)) / (len(sorted_error_values) - 1)
+    # # get values below P95
+    # selected_elements_below95 = [y for y in p if y <= 0.95]
+    # n_elements_select = len(selected_elements_below95)
+    # sorted_values_until95 = sorted_error_values[0:n_elements_select]
+
+    # determine inverse surface of CDF
+    surface_area = calc_inv_surface(sorted_error_values, p)
+    return surface_area
+
 def plot_generated_points(vertices, height, all_positions_train, all_positions_test, mic_positions, filename, title):
     """
     Plots the room given its vertices and height an all positions within the room
@@ -1102,6 +1182,7 @@ def plot_generated_points(vertices, height, all_positions_train, all_positions_t
     :param filename: name to save html file
     :param title: title of the plot
     """
+
     x_train = all_positions_train[:, 0]
     y_train = all_positions_train[:, 1]
     z_train = all_positions_train[:, 2]
@@ -1158,7 +1239,7 @@ def plot_generated_points(vertices, height, all_positions_train, all_positions_t
         )
         traces_top_bottom.append(trace2)
 
-    datapoints_training = [(go.Scatter3d(x=x_train, y=y_train, z=z_train, mode='markers', name='Training + Dev set', marker_size=5, marker=dict(color="#e9c46a")))]
+    datapoints_training = [(go.Scatter3d(x=x_train, y=y_train, z=z_train, mode='markers', name='Training + dev set', marker_size=5, marker=dict(color="#e9c46a")))]
     datapoints_test = [(go.Scatter3d(x=x_test, y=y_test, z=z_test, mode='markers', name='Test set', marker_size=5, marker=dict(color="#4D4C38")))]
     mics = [(go.Scatter3d(x=x_mic, y=y_mic, z=z_mic, mode='markers', name='Anchors', marker_size=5, marker=dict(color="#BB4406", symbol='square')))]
 
@@ -1166,8 +1247,624 @@ def plot_generated_points(vertices, height, all_positions_train, all_positions_t
     fig = go.Figure(data=datapoints_training + datapoints_test + mics + traces_vert + traces_top_bottom)
 
     fig.update_layout(title=title, autosize=True)
+    fig.update_scenes(xaxis = dict( title_text='x [m]'),
+                      yaxis = dict( title_text='y [m]'),
+                      zaxis = dict( title_text='z [m]'))
     fig.write_html(filename + ".html")
     #fig.show()
+
+
+def get_room_planes(vertices, height, offset):
+    """
+    Get al the surfaces as polygons of a random 3D room. An offset can be added to get an inner room.
+    :param vertices: vertices of the groundplane
+    :param height: the height of the room
+    :param offset: an offset to get an inner room of the total room
+    :return: a list of all the planes as polygons
+    """
+    # Create a 2D polygon from the ground plane vertices
+    ground_polygon_outer = Polygon(vertices)
+
+    # Get inner polygon with offset
+    polygon_inner = ground_polygon_outer.buffer(-offset)
+
+    # Simplify the polygon and get the reduced set of vertices
+    polygon_inner_simp = polygon_inner.simplify(0.1, preserve_topology=True)
+
+    # Extract the new vertices as a list of tuples
+    vertices_inner = list(polygon_inner_simp.exterior.coords)[:-1]
+
+    # Add extra z dimension to ground plane
+    ground_polygon_inner = Polygon([(x, y, offset) for x, y in vertices_inner])
+    ceiling_polygon_inner = Polygon([(x, y, height-offset) for x, y in vertices_inner])
+
+    polygons = [ground_polygon_inner, ceiling_polygon_inner]
+    # Create the wall polygons and add to the polygons list
+    for i in range(len(vertices_inner)):
+        p1, p2 = vertices_inner[i], vertices_inner[(i + 1) % len(vertices_inner)]
+        polygon = Polygon([(p1[0], p1[1], offset), (p2[0], p2[1], offset), (p2[0], p2[1], height-offset), (p1[0], p1[1], height-offset)])
+        polygons.append(polygon)
+
+    return polygons
+
+def check_closest_plane_relation(polygons):
+    """
+    Maps the polygons to best xy, xz or yz plane
+    :param polygons: list of given polygons
+    :return: mapping: 0 = xy, 1 = yz, 2= xz
+    """
+
+    relation_array = []
+    for polygon in polygons:
+        # Get the normal vector of the polygon's plane
+        n = np.cross(np.array(polygon.exterior.coords)[1] - np.array(polygon.exterior.coords)[0],
+                     np.array(polygon.exterior.coords)[2] - np.array(polygon.exterior.coords)[1])
+
+        # Determine which axis the plane is most perpendicular to
+        if abs(n[2]) > abs(n[0]) and abs(n[2]) > abs(n[1]):
+            # Polygon is closest to xy plane
+            value = 0
+        elif abs(n[0]) > abs(n[1]) and abs(n[0]) > abs(n[2]):
+            # Polygon is closest to yz plane
+            value = 1
+        else:
+            # Polygon is closest to xz plane
+            value = 2
+
+        relation_array.append(value)
+
+    return relation_array
+
+
+def calculate_3d_polygon_centroid(polygon):
+    """
+    Calculate the centroid of a 3D polygon given as a `Polygon` object from the Shapely package.
+
+    Args:
+    - polygon (Polygon): The polygon object to calculate the centroid of.
+
+    Returns:
+    - A numpy array representing the coordinates of the centroid in 3D space.
+    """
+    # Extract the coordinates of the vertices of the polygon
+    vertices = polygon.exterior.coords[:-1]
+
+    # Convert the coordinates to a numpy array
+    vertices = np.array(vertices)
+
+    # Calculate the centroid using the mean of the vertices along each axis
+    centroid = np.mean(vertices, axis=0)
+
+    # Return the centroid as a numpy array
+    return centroid
+
+def get_cardinal_directions(polygons):
+    """
+    Returns a list of the cardinal directions (north, east, south, west) for each polygon in the room.
+    The closest_plane_indices is a list of integers indicating the closest plane (xy=0, yz=1, xz=2) for each polygon.
+    """
+    closest_planes = check_closest_plane_relation(polygons)
+
+    centroid_ground = calculate_3d_polygon_centroid(polygons[0])
+    z_middle = calculate_3d_polygon_centroid(polygons[2])[2]
+    room_centroid = np.append(centroid_ground[:2], z_middle)
+
+    # Define the direction vectors for north, east, south, west, floor, and ceiling
+    north = np.array([0, 1, 0])
+    east = np.array([1, 0, 0])
+    south = np.array([0, -1, 0])
+    west = np.array([-1, 0, 0])
+    floor = np.array([0, 0, -1])
+    ceiling = np.array([0, 0, 1])
+
+    surface_centroids = []
+    for poly in polygons:
+        centroid = calculate_3d_polygon_centroid(poly)
+        surface_centroids.append(centroid)
+
+    cardinal_directions = []
+    for i, surface_centroid in enumerate(surface_centroids):
+        # Adjust room centroid to move along surface axis
+        if closest_planes[i] ==0:
+            # for the rooms of the simulation not needed only one ground and roof
+            room_centroid_adj = copy.deepcopy(room_centroid)
+        elif closest_planes[i]==1:
+            # adjust y parameter for yz plane
+            y_adj = surface_centroid[1]
+            room_centroid_adj = copy.deepcopy(room_centroid)
+            room_centroid_adj[1] = y_adj
+        elif closest_planes[i] == 2:
+            # adjust y parameter for xz plane
+            x_adj = surface_centroid[0]
+            room_centroid_adj = copy.deepcopy(room_centroid)
+            room_centroid_adj[0] = x_adj
+
+        # Calculate the vector from the room centroid to the surface centroid
+        vector = surface_centroid - room_centroid_adj
+        # Calculate the normal vector of the surface by normalizing the vector
+        normal = vector / np.linalg.norm(vector)
+
+        # Determine which direction the normal vector is pointing
+        dot_products = [np.dot(normal, direction) for direction in [north, east, south, west, floor, ceiling]]
+        max_dot_product = max(dot_products)
+        max_index = dot_products.index(max_dot_product)
+        directions = ['north', 'east', 'south', 'west', 'floor', 'ceiling']
+        direction = directions[max_index]
+        cardinal_directions.append(direction)
+
+    return cardinal_directions, room_centroid
+
+def get_surface_polygon(polygon):
+    """
+    Calculate the surface area of a 2D polygon placed in a 3D space and thus defined by 3D vertices
+    :param polygon:
+    :return: surface area
+    """
+    vertices = np.array(polygon.exterior.coords[:-1])
+    n = len(vertices)
+
+    # Calculate the surface area of the polygon
+    p1 = vertices[:-2]
+    p2 = vertices[1:-1]
+    p3 = vertices[2:]
+    v1 = p2 - p1
+    v2 = p3 - p1
+    cross = np.cross(v1, v2)
+    area = 0.5 * np.sum(np.sqrt(np.sum(cross ** 2, axis=1)))
+
+    return area
+
+def is_point_on_line(x, y, x1, y1, x2, y2, margin):
+    # Calculate the slope of the line
+    m = (y2 - y1) / (x2 - x1)
+
+    # Calculate the value of y on the line for the given x
+    y_on_line = m * (x - x1) + y1
+
+    # Check if the absolute difference between y_on_line and y is less than or equal to the margin
+    return abs(y_on_line - y) <= margin
+
+def check_point_in_polygon(polygon, point):
+    #project polygon and point to xy yz xz planes
+    vertices = np.array(polygon.exterior.coords[:-1])
+
+    # Project the vertices onto the XY, XZ, and YZ planes
+    xy_vertices = [(vertex[0], vertex[1]) for vertex in vertices]
+    xz_vertices = [(vertex[0], vertex[2]) for vertex in vertices]
+    yz_vertices = [(vertex[1], vertex[2]) for vertex in vertices]
+
+    # Create polygons from the projected vertices
+    xy_polygon = Polygon(xy_vertices).buffer(0)
+    xz_polygon = Polygon(xz_vertices).buffer(0)
+    yz_polygon = Polygon(yz_vertices).buffer(0)
+    polygon_proj = [xy_polygon, xz_polygon, yz_polygon]
+
+    # If empty polygons: plane was parallel to xy xz or yz planes (2 will be empty) --> check common parameter of emptys x y or z
+    # and check if point's x y or z value is same as the constant from polygon
+    index_empty = []
+    for i, polygon in enumerate(polygon_proj):
+        if polygon_proj[i].is_empty:
+            index_empty.append(i)
+    # if surface is a sloping wall then another situation can occur. with 1 empty index value, since roof and floor are always flat this
+    # is always index 0
+    if index_empty == [0, 1]:
+        vertex_idx = 0  # x dim is a constant
+    elif index_empty == [0, 2]:
+        vertex_idx = 1  # y dim is a constant
+    elif index_empty == [1, 2]:
+        vertex_idx = 2  # z dim is a constant
+    elif index_empty == [0]:
+        x1, x2 = xy_vertices[1][0], xy_vertices[0][0]
+        y1, y2 = xy_vertices[1][1], xy_vertices[0][1]
+
+    else: vertex_idx = False
+
+    # Project the point onto each plane
+    xy_point = Point(point.x, point.y)
+    xz_point = Point(point.x, point.z)
+    yz_point = Point(point.y, point.z)
+    point_proj = [xy_point, xz_point, yz_point]
+
+    point_np = np.array([point.x, point.y, point.z])
+
+    # Check if projected point is in projected polygons
+    point_in_polygon = False
+    sumcheck = 0
+    margin = 0.01
+    for i, poly in enumerate(polygon_proj):
+        point_check = point_proj[i]
+        if poly.is_empty and not polygon_proj[1].is_empty and not polygon_proj[2].is_empty :
+            check = is_point_on_line(point_check.x, point_check.y, x1, y1, x2, y2, margin)
+
+        elif poly.is_empty:
+            ct_coord = np.around(np.mean(np.array([vertex[vertex_idx] for vertex in vertices])), decimals = 2)
+            point_coord = np.around(point_np[vertex_idx], decimals=2)
+            if point_coord == ct_coord: check = True
+            else: check = False
+        else:
+            check = poly.intersects(point_check)  #contains or point.within(polygon)
+        if check:
+            sumcheck += 1
+
+    if sumcheck == 3: point_in_polygon = True
+
+    return point_in_polygon
+
+def get_dir_vector_middle_room(centroid, anchor):
+    xa, ya, za = anchor[0], anchor[1], anchor[2]
+    xc, yc, zc = centroid[0], centroid[1], centroid[2]
+
+    dx = xc - xa
+    dy = yc - ya
+    dz = zc - za
+
+    coalt = math.degrees(math.acos(dz / np.sqrt(dx*dx + dy*dy + dz*dz)))
+    azim = math.degrees(math.atan2(dy, dx))
+
+    if coalt <0:
+        coalt = -coalt
+        azim += 180
+    elif coalt > 180:
+        coalt = 360 - coalt
+        azim += 180
+
+    if azim <0:
+        azim = azim+360
+
+    return azim, coalt
+
+def get_dir_vector_perp_wall(polygon):
+    # Determine normal to polygon
+    n = np.cross(np.array(polygon.exterior.coords)[1] - np.array(polygon.exterior.coords)[0],
+                 np.array(polygon.exterior.coords)[2] - np.array(polygon.exterior.coords)[1])
+
+    azim = np.degrees(np.arctan2(n[1], n[0]))
+    coalt = np.degrees(np.arccos(n[2] / np.linalg.norm(n)))
+
+    if not 0 <= coalt <= 180:
+        print('tdod')
+
+    if coalt <0:
+        coalt = -coalt
+        azim += 180
+    elif coalt > 180:
+        coalt = 360 - coalt
+        azim += 180
+
+    if azim <0:
+        azim = azim+360
+
+    return azim, coalt
+
+
+def generate_random_points_in_polygon(polygon, n, dir_prop, centroid_room):
+    """
+    Generates random location points and directivity vector information in polygon
+    :param polygon: the polygon in 3D space
+    :param n: amount of random lcoation points
+    :param dir_prop: 'perpendicular' or 'middle' to set if speaker or mic has to point towards middle of room or be perpendicular to the surface
+    :return: matrix of points with x y z azimuth colatitude (last 2 in degrees) per row
+    """
+    points = np.array([[1,1,1,1,1]])
+
+
+    coords = polygon.exterior.coords
+    minx, miny, minz = np.min(coords, axis=0)
+    maxx, maxy, maxz = np.max(coords, axis=0)
+    while np.shape(points)[0] < n+1:
+        random_point = Point(np.random.uniform(minx, maxx), np.random.uniform(miny, maxy),
+                             np.random.uniform(minz, maxz))
+        if check_point_in_polygon(polygon,random_point):
+            point = np.array([random_point.x, random_point.y, random_point.z])
+
+            if dir_prop == 'middle':
+                #Determine and add azimuth and coaltitude information for the point
+                azimuth, coaltitude = get_dir_vector_middle_room(centroid_room, point)
+            else:
+                azimuth, coaltitude = get_dir_vector_perp_wall(polygon)
+
+            dir_info = np.array([azimuth, coaltitude])
+            point_info = np.append(point, dir_info)
+
+            points = np.vstack((points, point_info))
+
+    points = np.delete(points, 0, 0)
+
+    return points
+
+def generate_random_anchor_positions(vertices, height, n, offset, surfaces_array, dir_anch_vect_towards):
+    """
+    Generates random positions of anchor nodes given a random room
+    :param vertices: vertices of ground plane of the room
+    :param height: Height of the room
+    :param n: number of anchor positions
+    :param offset: distance from walls
+    :param surfaces_array: array with surfaces to cover= ['floor','ceiling', 'north', 'east', 'south', 'west'] with True or False
+    :param dir_anch_vect_towards: towards where the directivitie has to point: 'middle' or 'perpendicular'
+    :return: positions of all anchors + directivity
+    """
+
+    # Get the inner room planes (floor, ceiling and walls)
+    polygons = get_room_planes(vertices, height, offset)
+
+    # Get the cardinal directions (nord east south west floor ceiling)
+    cardinal_directions, room_centroid = get_cardinal_directions(polygons)
+
+    cardinals = ['floor','ceiling', 'north', 'east', 'south', 'west']
+    active_anchor_places = [cardinals[element] for element in range(len(surfaces_array)) if surfaces_array[element]]
+
+    # Select the polygons that have corresponing cardinals based on the indexes derived from the cardinal_directions list
+    indexes_selected_polygons = [i for i, direction in enumerate(cardinal_directions) if direction in active_anchor_places]
+    selected_polygons = [polygons[i] for i in indexes_selected_polygons]
+
+    # Split the amount of needed anchors per surface over the polygons bases on the surface area
+    # Get surfaces of the polygons
+    surfaces_selected_polygons = []
+    for polygon in selected_polygons:
+        surface = get_surface_polygon(polygon)
+        surfaces_selected_polygons.append(surface)
+
+    # Devide amount of points over the surfaces as a ratio
+    total_surface = sum(surfaces_selected_polygons)
+    ratio_surfaces = []
+    for surface in surfaces_selected_polygons:
+        ratio = surface/total_surface
+        ratio_surfaces.append(ratio)
+
+    number_anchors_per_surface = np.rint(n * np.array(ratio_surfaces))
+
+    # Check if total number of anchor positions is still the same
+    n_generated = np.sum(number_anchors_per_surface)
+    if not n_generated == n:
+        # add at random index difference
+        i = random.randint(0, np.size(number_anchors_per_surface)-1)
+        if n_generated < n:
+            diff = n-n_generated
+            number_anchors_per_surface[i] += diff
+        if n_generated > n:
+            diff = n_generated-n
+            number_anchors_per_surface[i] -= diff
+
+    # Deploy anchors at every surface
+    anchor_positions_all = np.empty(5)
+    for i, polygon in enumerate(selected_polygons):
+        number_of_anchors = number_anchors_per_surface[i]
+        anchor_positions = generate_random_points_in_polygon(polygon, number_of_anchors, dir_anch_vect_towards, room_centroid)  # 'perpendicular' or 'middle' for directivity perp to surface or pointing to middle of room
+        anchor_positions_all = np.vstack((anchor_positions_all, anchor_positions))
+
+    anchor_positions_all = np.delete(anchor_positions_all, 0, 0)
+
+    return anchor_positions_all
+
+def polygon_area(polygon):
+    # Calculate the area of a 2D polygon using the shoelace formula
+    x, y = polygon.exterior.coords.xy
+    area = 0.5*abs(sum(x[i]*y[i+1]-x[i+1]*y[i] for i in range(len(x)-1)))
+    return area
+
+
+def create_dir_speaker_plot_objects(positions, dir_pattern, scale, color, name):
+    azimuth_plot = np.linspace(start=0, stop=360, num=35, endpoint=True) #361
+    colatitude_plot = np.linspace(start=0, stop=180, num=35, endpoint=True) #180
+
+    dir_obj = []
+    for p in positions:
+        x_offset = p[0]
+        y_offset = p[1]
+        z_offset = p[2]
+        azi = p[3]
+        coalt = p[4]
+
+        spher_coord = np.array(list(itertools.product(azimuth_plot, colatitude_plot)))  #All combinations pyroom
+
+        azi_flat = spher_coord[:, 0]
+        col_flat = spher_coord[:, 1]
+
+        dir_pattern_obj = CardioidFamily(
+            orientation=DirectionVector(azimuth=azi, colatitude=coalt, degrees=True),
+            pattern_enum=dir_pattern
+        )
+
+        # compute response
+        resp = dir_pattern_obj.get_response(azimuth=azi_flat, colatitude=col_flat ,magnitude=True, degrees=False)
+        RESP = resp.reshape(len(azimuth_plot), len(colatitude_plot))
+
+        # create surface plot, need cartesian coordinates
+        AZI, COL = np.meshgrid(azimuth_plot, colatitude_plot)
+        X = scale * RESP.T * np.sin(COL) * np.cos(AZI) + x_offset
+        Y = scale * RESP.T * np.sin(COL) * np.sin(AZI) + y_offset
+        Z = scale * RESP.T * np.cos(COL) + z_offset
+
+        points = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+        fig_obj = go.Mesh3d(x=points[:, 0], y=points[:, 1], z=points[:, 2], alphahull=0.4, opacity=0.3, color=color,
+                            legendgroup=name)
+        dir_obj.append(fig_obj)
+
+        legend = go.Scatter3d(
+            x=[None], y=[None], z=[None],
+            mode='markers',
+            name=name,
+            line=dict(color=color, width=2),
+            opacity=0.3,
+            hoverinfo='none',
+            showlegend=True,
+            legendgroup=name  # use the same custom legend group
+        )
+
+    return dir_obj, legend
+
+def create_plot_dir_vector_object(coaltitudes, azimuths, locations, name):
+    # Directivity vectors
+    length = 0.25
+    # Convert coaltitude to zenith angle in radians
+    zenith_angle = np.radians(coaltitudes)
+    # Convert azimuth to radians
+    azimuth_rad = np.radians(azimuths)
+
+    dx = np.sin(zenith_angle) * np.cos(azimuth_rad)
+    dy = np.sin(zenith_angle) * np.sin(azimuth_rad)
+    dz = np.cos(zenith_angle)
+    direction_vector = (np.array([dx, dy, dz])).T
+    end_point = locations[:, 0:3] + length * direction_vector
+
+    x = locations[:,0]
+    y = locations[:,1]
+    z = locations[:,2]
+
+    dir_vects_anchors = []
+    for i, point in enumerate(end_point):
+        line_dir = go.Scatter3d(
+            x=[x[i], point[0]], y=[y[i], point[1]], z=[z[i], point[2]],
+            mode='lines',
+            line=dict(color='black', width=4),
+            hoverinfo='none',
+            text=name,
+            connectgaps=False,
+            showlegend=False,
+            legendgroup=name
+        )
+        dir_vects_anchors.append(line_dir)
+
+    dir_vects_legend_anchors = go.Scatter3d(
+        x=[None], y=[None], z=[None],
+        mode='lines',
+        name=name,
+        line=dict(color='black', width=2),
+        hoverinfo='none',
+        showlegend=True,
+        legendgroup=name  # use the same custom legend group
+    )
+
+    return dir_vects_anchors, dir_vects_legend_anchors
+
+def plot_generated_speaker_pos(vertices, height, anchor_locs, mn_loc_test_set, mn_loc_traindev_set,
+                               plt_dir_vect_ancher, plot_dirs_ancher, plt_dir_vect_mn, plot_dirs_mn,
+                               dir_pattern_ancher, dir_pattern_mn_test, dir_pattern_mn_train, filename, title):
+    """
+        Plots the room with anchors and mobile nodes (mn) given its vertices and height an all positions within the room
+        Directivity vectors and directivities are also plotted if set to True
+    :param vertices: coordinates of corners in 2D
+    :param height: height of the room
+    :param anchor_locs: location of the anchors np array: [[x1, y1, z1, azi1, coalt1 ], [x2, y2, ... ], ...]
+    :param mn_loc_test_set: location of the test set mobile nodes np array: [[x1, y1, z1, azi1, coalt1 ], [x2, y2, ... ], ...]
+    :param mn_loc_traindev_set: location of the dev and train set mobile nodes np array: [[x1, y1, z1, azi1, coalt1 ], [x2, y2, ... ], ...]
+    :param plt_dir_vect_ancher: True or False to plot a vector for anchor directivity
+    :param plot_dirs_ancher: True or False to plot the directivities of the anchors
+    :param plt_dir_vect_mn: True or False to plot a vector for mobile node directivity
+    :param plot_dirs_mn: True or False to plot the mobile node directivities
+    :param dir_pattern_ancher: Directivity pattern of anchor nodes: e.g. DirectivityPattern.CARDIOID (via PyroomAcoustics)
+    :param dir_pattern_mn_test: Directivity pattern of test set mn's: e.g. DirectivityPattern.CARDIOID (via PyroomAcoustics)
+    :param dir_pattern_mn_traindev: Directivity pattern of dev and train set mn's: e.g. DirectivityPattern.CARDIOID (via PyroomAcoustics)
+    :param filename: name of the .html file to save it
+    :param title: Title of the plotly plot
+    """
+    x_an = anchor_locs[:,0]
+    y_an = anchor_locs[:,1]
+    z_an = anchor_locs[:,2]
+    azimuth_anch = anchor_locs[:,3]
+    coaltitude_anch = anchor_locs[:,4]
+
+    x_test = mn_loc_test_set[:, 0]
+    y_test = mn_loc_test_set[:, 1]
+    z_test = mn_loc_test_set[:, 2]
+    azimuth_test = mn_loc_test_set[:,3]
+    coaltitude_test = mn_loc_test_set[:,4]
+
+    x_train = mn_loc_traindev_set[:, 0]
+    y_train = mn_loc_traindev_set[:, 1]
+    z_train = mn_loc_traindev_set[:, 2]
+    azimuth_train = mn_loc_traindev_set[:,3]
+    coaltitude_train = mn_loc_traindev_set[:,4]
+
+    mn_all = np.vstack((mn_loc_test_set, mn_loc_traindev_set))
+
+    traces_vert = []
+    for corner in vertices:
+        trace = go.Scatter3d(
+            x=[corner[0], corner[0]], y=[corner[1], corner[1]], z=[0, height],
+            mode='lines',
+            line=dict(color='black', width=2),
+            hoverinfo='none',
+            text=None,
+            connectgaps=False,
+            showlegend=False
+        )
+        traces_vert.append(trace)
+
+    # Create ground and top plane of room
+    edges_top_ground = edges_from_vertices_2D(vertices)
+
+    traces_top_bottom = []
+    for edge in edges_top_ground:
+        x_tr, y_tr = zip(*edge)
+        trace1 = go.Scatter3d(
+            x=x_tr, y=y_tr, z=[height, height],
+            mode='lines',
+            line=dict(color='black', width=2),
+            hoverinfo='none',
+            text=None,
+            connectgaps=False,
+            showlegend=False
+        )
+        traces_top_bottom.append(trace1)
+        trace2 = go.Scatter3d(
+            x=x_tr, y=y_tr, z=[0, 0],
+            mode='lines',
+            line=dict(color='black', width=2),
+            hoverinfo='none',
+            text=None,
+            connectgaps=False,
+            showlegend=False
+        )
+        traces_top_bottom.append(trace2)
+
+
+    anchers = [(go.Scatter3d(x=x_an, y=y_an, z=z_an, mode='markers', name='Anchors', marker_size=5,
+                             marker=dict(color="#BB4406", symbol='square')))]
+    datapoints_training = [(go.Scatter3d(x=x_train, y=y_train, z=z_train, mode='markers', name='Training + dev set',
+                                         marker_size=5, marker=dict(color="#485e3d")))]
+    datapoints_test = [(go.Scatter3d(x=x_test, y=y_test, z=z_test, mode='markers', name='Test set', marker_size=5,
+                                     marker=dict(color="#a28be3")))]
+
+    data = anchers + datapoints_training + datapoints_test + traces_vert + traces_top_bottom
+
+    if plt_dir_vect_ancher:
+        dir_vects_anchors, dir_vects_legend_anchors = create_plot_dir_vector_object(coaltitude_anch, azimuth_anch, anchor_locs, 'Directivity vector anchors') #TODO
+        data = data + dir_vects_anchors + [dir_vects_legend_anchors]
+
+    if plot_dirs_ancher:
+        dirs_anchers, dir_anchors_legend = create_dir_speaker_plot_objects(anchor_locs, dir_pattern_ancher, scale=0.5, color='orange', name='Directivity anchors')
+        data = data + dirs_anchers + [dir_anchors_legend]
+
+    if plt_dir_vect_mn:
+        dir_vect_mn, dir_vects_legend_mn = create_plot_dir_vector_object(mn_all[:, 3], mn_all[:,4], mn_all[:, 0:3], 'Directivity vector mobile nodes')
+        data = data + dir_vect_mn + [dir_vects_legend_mn]
+
+    if plot_dirs_mn:
+        dirs_mn_test, dir_mn_legend_test = create_dir_speaker_plot_objects(mn_loc_test_set, dir_pattern_mn_test, scale=0.3,
+                                                                           color = 'purple', name='Directivity test set')
+        data = data + dirs_mn_test + [dir_mn_legend_test]
+
+        dirs_mn_train, dir_mn_legend_train = create_dir_speaker_plot_objects(mn_loc_traindev_set, dir_pattern_mn_train, scale=0.3,
+                                                                           color='green', name='Directivity training + dev set')
+        data = data + dirs_mn_train + [dir_mn_legend_train]
+
+    # Create a Scatter trace for the points
+    fig = go.Figure(data=data)
+
+    fig.update_layout(title=title, autosize=True)
+    fig.update_scenes(xaxis = dict( title_text='x [m]'),
+                      yaxis = dict( title_text='y [m]'),
+                      zaxis = dict( title_text='z [m]'))
+    fig.write_html(filename + ".html")
+    #fig.show()
+
+def plot_histo(data, nbins):
+    plt.hist(data, bins=nbins, density=True)
+    plt.ylabel('Probability')
+    plt.xlabel('Error (m)')
+    plt.show()
 
 def plot_CDF(sortIntersection, sortRB, sortBeck, sortChueng, sortGN, title, filename):
     """
@@ -1313,7 +2010,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 def plot_room_errors(positions, error, mic_positions, filename, title, cmax):
     """
-    Plots the room in 3d with corresponding error values at the position as 4th dimension
+    Plots the room in 3d with corresponding error values at the position as 4th dimension, the mic name is an old choice, see this as the anchor points
     :param positions: positions of interest in the room
     :param error: error on specific positions
     :param mic_positions: microphone positions
@@ -1336,7 +2033,7 @@ def plot_room_errors(positions, error, mic_positions, filename, title, cmax):
     x_mic = []
     y_mic = []
     z_mic = []
-    for coord in mic_positions.T:
+    for coord in mic_positions:
         x_mic.append(coord[0])
         y_mic.append(coord[1])
         z_mic.append(coord[2])
@@ -1381,7 +2078,7 @@ def plot_room_errors(positions, error, mic_positions, filename, title, cmax):
         )
         traces_top_bottom.append(trace2)
 
-    positions = [(go.Scatter3d(x=x_pos, y=y_pos, z=z_pos, mode='markers', name='Error in m', marker_size=10,
+    positions = [(go.Scatter3d(x=x_pos, y=y_pos, z=z_pos, mode='markers', name='Error in m', marker_size=10,  text=[f'Point {i}<br>Error: {error[i]:.2f} m' for i in range(len(error))],
                                marker=dict(color=error, colorscale='Viridis', opacity=0.8, showscale=True, cmin=0, cmax=cmax)))]
     mics = [(go.Scatter3d(x=x_mic, y=y_mic, z=z_mic, mode='markers', name='Anchors', marker_size=5,
                               marker=dict(color="#BB4406", symbol='square')))]

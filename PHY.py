@@ -17,13 +17,14 @@
 #
 #  Description:
 #
-#  Room simulation with multiple microphones at walls and one mobile speaker at different locations
+#  Room simulation with multiple speakers microphones (mobile node and anchors can be generated for random rooms)
 #
 #  License L (optionally)
 # --------------------------------------------------------------------------------------------
 import pyroomacoustics as pra
 import numpy as np
 import sys
+import csv
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
 import localFunctions as lf
@@ -34,6 +35,11 @@ import multiprocessing as mp
 import logging
 import tqdm
 from functools import partial
+from pyroomacoustics.directivities import (
+    DirectivityPattern,
+    DirectionVector,
+    CardioidFamily
+)
 
 # logging
 logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
@@ -48,102 +54,159 @@ def setup():
     # #############################################################################################
     with open('config.json') as json_file:
         config = json.load(json_file)
-    # --------------------------------
-    # MIC AND SPEAKER CHARACTERISTICS
-    # --------------------------------
-    # Create grid of mic positions
-    position_mic_0 = [0.01, 0.01, 0.01]
-    position_mic_1 = [7.99, 3.99, 2.39]
-    position_mic_2 = [0.01, 3.99, 1.6]
-    position_mic_3 = [5.99, 0.01, 0.8]
-    position_mic_4 = [3.0, 1.01, 2.0]
-    position_mic_5 = [5.0, 3.99, 0.5]
-    position_mic_6 = [0.01, 1.1, 2.20]
-    position_mic_7 = [7.99, 3.2, 0.1]
-    position_mic_8 = [7.0, 1.05, 2.39]
-    position_mic_9 = [2.0, 3.0, 2.39]
-    position_mic_10 = [1.99, 0.75, 0.01]
-    position_mic_11 = [6.3, 1.85, 0.01]
-
-
-    # Location of all mics
-    mic_locs = np.c_[
-        position_mic_0,
-        position_mic_1,
-        position_mic_2,
-        position_mic_3,
-        position_mic_4,
-        position_mic_5,
-        position_mic_6,
-        position_mic_7,
-        position_mic_8,
-        position_mic_9,
-        position_mic_10,
-        position_mic_11,
-    ]
-
-    np.save('mic_positions.npy', mic_locs)
-
 
     if config["shoebox"]:
-        # Create test set
-        sp_loc_test_set = lf.create_location_grid(config["distance_boundary"], config["room_dim_shoebox"],
-                                                  config['n_x_test'], config['n_y_test'], config["n_z_test"])
-
-        n_test_set_positions = np.size(sp_loc_test_set, axis=0)
-        logger.info('Amount of test set speaker positions: {}'.format(n_test_set_positions))
-
-        # Create data and dev set
-        n_positions_dev_train = lf.calc_n_dev_train_set(sp_loc_test_set, config['train_set_ratio'], config['dev_set_ratio'], config['test_set_ratio'])
-        sp_loc_traindev_set = lf.create_random_positions_shoebox(room_dim, n_positions_dev_train, config['distance_boundary'])
-
+        logger.info('Shoebox simulation activated')
         height = room_dim[2]
         vertices = np.array([[0, 0], [0, room_dim[1]], [room_dim[0], room_dim[1]], [room_dim[0], 0]])
-        np.save('outcounted.npy', 0)
     else:
+        logger.info('Non Shoebox simulation activated')
         vertices = config['room_corners_no_shoebox']
         height= config['room_height_no_shoebox']
 
+    # -----------------------------------------
+    # Read or Generate Mobile Node (MN) AND Anchor Positions
+    # -----------------------------------------
+    # MOBILE NODE POSITIONS -----------------------------------------------------------------------------------------
+    if config['generate_random_MN_pos']:
+        # Generate mobile node locations
         # Create test set
-        sp_loc_test_set, out_count_test = lf.create_location_grid_non_shoebox(vertices, height, config["distance_boundary"],
+        mn_loc_test_set, out_count_test = lf.create_location_grid_non_shoebox(vertices, height, config["distance_boundary"],
                                                               config['n_x_test'], config['n_y_test'], config["n_z_test"])
 
-        n_test_set_positions = np.size(sp_loc_test_set, axis=0)
-        logger.info('Amount of test set speaker positions: {}'.format(n_test_set_positions))
+        n_test_set_positions = np.size(mn_loc_test_set, axis=0)
+        logger.info('Amount of test set mobile node positions: {}'.format(n_test_set_positions))
 
         # Create data and dev set
-        n_positions_dev_train = lf.calc_n_dev_train_set(sp_loc_test_set, config['train_set_ratio'],
+        n_positions_dev_train = lf.calc_n_dev_train_set(mn_loc_test_set, config['train_set_ratio'],
                                                         config['dev_set_ratio'], config['test_set_ratio'])
 
-        sp_loc_traindev_set, out_counts = lf.create_random_positions_in_random_3D_space(vertices, height, config['distance_boundary'], n_positions_dev_train)
+        mn_loc_traindev_set, out_counts = lf.create_random_positions_in_random_3D_space(vertices, height, config['distance_boundary'], n_positions_dev_train)
 
-        logger.info('Amount of regenerated train and dev set speaker positions that were outside the room: {}'.format(out_counts))
-        np.save('outcounted.npy', out_count_test)
+        logger.info('Amount of regenerated train and dev set mobile node positions that were outside the room: {}'.format(out_counts))
+        np.save('Sim_data\\outcounted.npy', out_count_test)
 
-    if config["plot_room"]:
-        lf.plot_generated_points(vertices, height, sp_loc_traindev_set, sp_loc_test_set, mic_locs, path_fig+'generated_training_points', 'Training and Dev set')
+        mn_loc_all = np.vstack((mn_loc_test_set, mn_loc_traindev_set))
+        np.savetxt('Sim_data\\positions_mobile_node.csv', mn_loc_all, delimiter=',')
 
-    n_traindev_set_positions = np.size(sp_loc_traindev_set, axis=0)
-    logger.info('Amount of train and dev set speaker positions: {}'.format(n_traindev_set_positions))
+    else:
+        # Read out from CSV if already exist
+        mn_csv = []
+        with open('Sim_data\\positions_mobile_node.csv') as csv_file:
+            csv_reader = csv.reader(csv_file, delimiter=',')
+            for row in csv_reader:
+                pos_read = [float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])]
+                mn_csv.append(pos_read)
 
-    sp_loc_all = np.vstack((sp_loc_test_set, sp_loc_traindev_set))
+        mn_loc_all = np.array(mn_csv)
+
+        out_counted = np.load('Sim_data\\outcounted.npy')
+        # Calculate amount of test set grid points (for non-shoebox not n_x_test * n_y_test * n_z_test)
+        n_test_set_positions = (config['n_x_test'] * config['n_y_test'] * config['n_z_test'])-out_counted
+        mn_loc_test_set = mn_loc_all[:n_test_set_positions, :]
+        mn_loc_traindev_set = mn_loc_all[n_test_set_positions:, :]
+
+    n_traindev_set_positions = np.size(mn_loc_traindev_set, axis=0)
+    logger.info('Amount of train and dev set mobile node positions: {}'.format(n_traindev_set_positions))
+
+    n_test_set_positions = np.size(mn_loc_test_set, axis=0)
+    logger.info('Amount of test set mobile node positions: {}'.format(n_test_set_positions))
 
     # calculate amount of positions integrated
-    n_positions_measured = np.size(sp_loc_all, axis=0)
-    logger.info('Total amount of speaker positions: {}'.format(n_positions_measured))
+    n_positions_measured = np.size(mn_loc_all, axis=0)
+    logger.info('Total amount of mobile node positions: {}'.format(n_positions_measured))
 
     # save positions
-    np.save('speaker_positions.npy', sp_loc_all)
+    np.save('Sim_data\\positions_mobile_node.npy', mn_loc_all)
+
+    # ANCHOR NODE POSITIONS
+    if config['generate_random_ancher_pos']:
+        surfaces_array = config['active_anchor_places']  # Floor Ceiling Nord East South West
+        offset = config['anchor_wall_offset']
+        anchor_locs = lf.generate_random_anchor_positions(vertices, height, config['number_generated_anchors'], offset,
+                                                          surfaces_array, config['dir_anchor_direction'])
+
+        np.savetxt('Sim_data\\anchor_positions.csv', anchor_locs, delimiter=',')
+        np.save('Sim_data\\anchor_positions.npy', anchor_locs)
+
+    else:  # read the existing csv file with speaker positions
+        anchor_pos_csv = []
+        with open('Sim_data\\anchor_positions.csv') as csv_file:
+            csv_reader = csv.reader(csv_file, delimiter=',')
+            for row in csv_reader:
+                pos_read_anchor = [float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])]
+                anchor_pos_csv.append(pos_read_anchor)
+
+        anchor_locs = np.array(anchor_pos_csv)
+
+    logger.info('Total amount of anchor node positions: {}'.format(np.size(anchor_locs, axis=0)))
+    # Plot room with directivities
+    pattern_enum_anchor = DirectivityPattern.CARDIOID
+    pattern_enum_mn_test = DirectivityPattern.OMNI
+    pattern_enum_mn_train = DirectivityPattern.OMNI
+
+    dirs_mn_test = []
+    dirs_mn_train_dev = []
+    for mn in mn_loc_test_set:
+        dir_obj_mn_test = CardioidFamily(
+            orientation=DirectionVector(azimuth=mn[3], colatitude=mn[4], degrees=True),
+            pattern_enum=pattern_enum_mn_test
+        )
+        dirs_mn_test.append(dir_obj_mn_test)
+
+    for mn in mn_loc_traindev_set:
+        dir_obj_mn_traindev = CardioidFamily(
+            orientation=DirectionVector(azimuth=mn[3], colatitude=mn[4], degrees=True),
+            pattern_enum=pattern_enum_mn_train
+        )
+        dirs_mn_train_dev.append(dir_obj_mn_traindev)
+
+    dirs_mn = dirs_mn_test + dirs_mn_train_dev
+
+    dirs_anchers = []
+    for anchor in anchor_locs:
+        dir_obj_ancher = CardioidFamily(
+            orientation=DirectionVector(azimuth=anchor[3], colatitude=anchor[4], degrees=True),
+            pattern_enum=pattern_enum_anchor
+        )
+        dirs_anchers.append(dir_obj_ancher)
+
+    if config["plot_room"]:
+        lf.plot_generated_speaker_pos(vertices, height, anchor_locs, mn_loc_test_set, mn_loc_traindev_set,
+                                      True, True, False, False, pattern_enum_anchor, pattern_enum_mn_test,
+                                      pattern_enum_mn_train, 'Sim_data\\Simulation_Room_dirs_anchors', 'Simulation Room')
+
+        lf.plot_generated_speaker_pos(vertices, height, anchor_locs, mn_loc_test_set, mn_loc_traindev_set,
+                                      True, True, True, True, pattern_enum_anchor, pattern_enum_mn_test,
+                                      pattern_enum_mn_train, 'Sim_data\\Simulation_Room_all_dirs', 'Simulation Room')
+
+        lf.plot_generated_speaker_pos(vertices, height, anchor_locs, mn_loc_test_set, mn_loc_traindev_set,
+                                      True, False, True, False, pattern_enum_anchor, pattern_enum_mn_test,
+                                      pattern_enum_mn_train, 'Sim_data\\Simulation_Room_only_dir_vect', 'Simulation Room')
+
+        lf.plot_generated_speaker_pos(vertices, height, anchor_locs, mn_loc_test_set, mn_loc_traindev_set,
+                                      False, False, False, False, pattern_enum_anchor, pattern_enum_mn_test,
+                                      pattern_enum_mn_train, 'Sim_data\\Simulation_Room_no_dirs',
+                                      'Simulation Room')
+
+
+    # Map speakers and mics to anchor and mobile node terminology
+    if config['anchors'] == 'speakers':
+        logger.info('Anchor nodes are speakers, mobile nodes are microphones')
+        sp_locs = anchor_locs
+        mic_locs = mn_loc_all
+        sp_dirs = dirs_anchers
+        mic_dirs = dirs_mn
+    else:
+        logger.info('Anchor nodes are microphones, mobile nodes are speakers')
+        sp_locs = mn_loc_all
+        mic_locs = anchor_locs
+        sp_dirs = dirs_mn
+        mic_dirs = dirs_anchers
 
     # --------------------------------
     #     ROOM CHARACTERISTICS
     # --------------------------------
-    # room loggings
-    if config["shoebox"]:
-        logger.info('Shoebox simulation activated')
-    else:
-        logger.info('Non Shoebox simulation activated')
-
     # Use given materials (below) e.g. wood True, if false, pre defined RT60 is used for RIR calculations
     # RT60 Seconds (not needed in case of materials)
     if config['use_given_materials']:
@@ -201,9 +264,11 @@ def setup():
     if config["plot_audio"]:
         lf.plot_audio_signal("Signal at speaker", audio, fs, duration_signal, config['delay_sim'])
 
-    return n_positions_measured, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_locs, audio, duration_signal
+    n_simulations_needed = np.size(sp_locs, axis=0)
 
-def sim_position(position_nr, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_locs, audio, duration_signal, use_materials,
+    return n_simulations_needed, mic_locs, sp_locs, mic_dirs, sp_dirs, fs, fs_source, fs_mic, v_sound, audio, duration_signal
+
+def sim_position(sim_nr, mic_locs, sp_locs, mic_dirs, sp_dirs, fs, fs_source, fs_mic, v_sound, audio, duration_signal, use_materials,
                  material, corners, shoebox, rt60, room_dim, room_height, air_abs, max_order, use_raytracer, delay_sim,
                  receiver_radius, plot_room, calc_rir, plot_rir, save_rir, plot_audio, save_rx_audio):
     # -----------------------------------------
@@ -214,8 +279,8 @@ def sim_position(position_nr, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_lo
             room_materials = pra.make_materials(
                 ceiling=material,
                 floor=material,
-                east=material,
-                west=material,
+                east='panel_fabric_covered_6pcf',
+                west='panel_fabric_covered_6pcf',
                 north=material,
                 south=material
             )
@@ -243,18 +308,10 @@ def sim_position(position_nr, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_lo
             # Calculate equivalent material absorption coefficient
             room_materials = pra.Material(e_absorption)
 
-    from pyroomacoustics.directivities import (
-        DirectivityPattern,
-        DirectionVector,
-        CardioidFamily
-    )
+    # Select one speaker (to not interference with others and do it via TDM
+    one_speaker_loc = sp_locs[sim_nr, :3]
+    dir_obj_one_speaker = sp_dirs[sim_nr]
 
-    dir_obj = CardioidFamily(
-        orientation=DirectionVector(azimuth=90, colatitude=15, degrees=True),
-        pattern_enum=DirectivityPattern.SUBCARDIOID
-    )
-
-    speaker_loc = sp_loc_all[position_nr, :]
     if not shoebox:
         room = pra.Room.from_corners(corners=corners, fs=fs, materials=room_materials, max_order=max_order,
                                      air_absorption=air_abs, ray_tracing=use_raytracer)
@@ -273,11 +330,17 @@ def sim_position(position_nr, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_lo
     # Set sound speed
     room.set_sound_speed(v_sound)
 
+    ##########################################
+    # --Add mics and speakers to the room ---
+    ##########################################
+    mic_loc_coord = mic_locs[:, 0:3]
+    mic_locs = mic_loc_coord.T
+
     if use_raytracer:
         # Place mic's in the room
         room.add_microphone_array(mic_locs)    # no Directivity possible with raytracing
         # Place Speaker in the room
-        room.add_source(speaker_loc, signal=audio, delay=delay_sim)  # No Directivity possible with raytracing
+        room.add_source(one_speaker_loc, signal=audio, delay=delay_sim)  # No Directivity possible with raytracing
         room.set_ray_tracing(receiver_radius=receiver_radius)
         # The receiver radius = radius of the sphere around the microphone in which to integrate the energy (default: 0.5 m)
 
@@ -285,14 +348,14 @@ def sim_position(position_nr, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_lo
         # Image Source Model
         if shoebox:
             # Place mic's in the room
-            room.add_microphone_array(mic_locs, directivity=dir_obj)  # Directivity list can be created also for different mics: =[dir_1, dir_2]
+            room.add_microphone_array(mic_locs, directivity=mic_dirs)  # Directivity list can be created also for different mics: =[dir_1, dir_2]
             # Place Speaker in the room
-            room.add_source(speaker_loc, signal=audio, delay=delay_sim, directivity=dir_obj)  # delay = start time in simulation in s
+            room.add_source(one_speaker_loc, signal=audio, delay=delay_sim, directivity=dir_obj_one_speaker)  # delay = start time in simulation in s
         else:
             # Place mic's in the room
-            room.add_microphone_array(mic_locs, directivity=dir_obj)
+            room.add_microphone_array(mic_locs, directivity=mic_dirs)
             # Place Speaker in the room
-            room.add_source(speaker_loc, signal=audio, delay=delay_sim)    # delay = start time in simulation in s
+            room.add_source(one_speaker_loc, signal=audio, delay=delay_sim)    # delay = start time in simulation in s
         room.image_source_model()
 
     # if plot_room:
@@ -330,15 +393,15 @@ def sim_position(position_nr, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_lo
         for s in range(room.n_sources):
             if calc_rir:
                 # Calculate RT60 between all mics and speakers
-                #logger.info("RT60 between the {}th mic and {}th source, position {}: {:.3f} s".format(m, s, position_nr, rt60_meas[m, s]))
+                #logger.info("RT60 between the {}th mic and {}th source, simulation {}: {:.3f} s".format(m, s, sim_nr, rt60_meas[m, s]))
                 rir = room.rir[m][s]
 
             # Plot the RIR between all mics and speakers
             if plot_rir:
-                lf.plot_RIR(title="RIR between the {}th mic and {}th source, position {}".format(m, s, position_nr), rir=rir, fs=fs)
+                lf.plot_RIR(title="RIR between the {}th mic and {}th source, simulation {}".format(m, s, sim_nr), rir=rir, fs=fs)
 
             if save_rir:
-                np.save('RIRs/rir'+str(s)+'source'+str(m)+'mic'+'_position'+str(position_nr)+'.npy', rir)
+                np.save('RIRs/rir'+str(s)+'source'+str(m)+'mic'+'_simulation'+str(sim_nr)+'.npy', rir)
 
             # Delete first 40 samples, artifact from simulation (issue #136 GitHub PyroomAcoustics)
             rx_audio = room.mic_array.signals[m, :]
@@ -358,15 +421,15 @@ def sim_position(position_nr, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_lo
 
             # Plot the received audio signals
             if plot_audio:
-                lf.plot_audio_signal(title="Received signal at the {}th mic from the {}th source, position".format(m, s, position_nr),
+                lf.plot_audio_signal(title="Received signal at the {}th mic from the {}th source, simulation".format(m, s, sim_nr),
                                      signal=mic_signal, fs=fs_mic, dur_orig_sig=duration_signal, delay=delay_sim)
 
             # Plot spectogram
-            #lf.plot_spectrogram(title="Received signal at the {}th mic from the {}th source, position".format(m, s, position_nr), signal=new_rx_audio, fs=fs, dur_orig_sig=duration_signal, delay=delay)
+            #lf.plot_spectrogram(title="Received signal at the {}th mic from the {}th source, simulation".format(m, s, sim_nr), signal=new_rx_audio, fs=fs, dur_orig_sig=duration_signal, delay=delay)
 
             if save_rx_audio:
                 # Writing the received audio signals to a WAV file
-                wavfile.write("RX_audio/Received_signal_of_the_{}th_mic_from_{}th_source_position_{}.wav".format(m, s, position_nr), rate=fs_mic, data=mic_signal.astype(np.int16))
+                wavfile.write("RX_audio/Received_signal_of_the_{}th_mic_from_{}th_source_simulation_{}.wav".format(m, s, sim_nr), rate=fs_mic, data=mic_signal.astype(np.int16))
 
     # #############################################################################################
     # ------------------------ Theoretical Distance Calculation-----------------------------------
@@ -374,17 +437,16 @@ def sim_position(position_nr, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_lo
     # Determine real theoretical distances
     distances_th = np.empty(1)
     for coord in mic_locs.T:
-        distance = lf.calc_distance_3D(speaker_loc[0], speaker_loc[1], speaker_loc[2], coord[0], coord[1], coord[2])
+        distance = lf.calc_distance_3D(one_speaker_loc[0], one_speaker_loc[1], one_speaker_loc[2], coord[0], coord[1], coord[2])
         distances_th = np.vstack((distances_th, distance))
 
     distances_th = np.delete(distances_th, 0, 0)
-    np.save('dist_th/distances_th_position'+str(position_nr)+'.npy', distances_th)
+    np.save('dist_th/distances_th_simulation_'+str(sim_nr)+'.npy', distances_th)
 
 def sim_position_init(q):
     sim_position.q = q
 
 if __name__ == '__main__':
-
     # -----------------------------------------
     #   READ CONFIG VARIABLES ONCE
     # -----------------------------------------
@@ -413,11 +475,15 @@ if __name__ == '__main__':
     # -----------------------------------------
     #   Multiprocessing
     # -----------------------------------------
-    n_positions_measured, sp_loc_all, fs, fs_source, fs_mic, v_sound, mic_locs, audio, duration_signal = setup()
+    n_simulations_needed, mic_locs, sp_locs, mic_dirs, sp_dirs, fs, fs_source, fs_mic, v_sound, audio, duration_signal = setup()
 
-    location_idx_all = np.arange(0, n_positions_measured, 1)
-    onearg_func = partial(sim_position, sp_loc_all=sp_loc_all, fs=fs, fs_source=fs_source, fs_mic=fs_mic,
-                          v_sound=v_sound, mic_locs=mic_locs, audio=audio, duration_signal=duration_signal,
+    # def sim_position(sim_nr, mic_locs, sp_locs, mic_dirs, sp_dirs, fs, fs_source, fs_mic, v_sound, audio, duration_signal, use_materials,
+    #                  material, corners, shoebox, rt60, room_dim, room_height, air_abs, max_order, use_raytracer, delay_sim,
+    #                  receiver_radius, plot_room, calc_rir, plot_rir, save_rir, plot_audio, save_rx_audio):
+
+    location_idx_all = np.arange(0, n_simulations_needed, 1)
+    onearg_func = partial(sim_position, mic_locs=mic_locs, sp_locs=sp_locs, mic_dirs=mic_dirs, sp_dirs=sp_dirs, fs=fs,
+                          fs_source=fs_source, fs_mic=fs_mic, v_sound=v_sound, audio=audio, duration_signal=duration_signal,
                           use_materials=use_materials, material=material, corners=corners, shoebox=shoebox,
                           rt60=rt60, room_dim=room_dim, room_height=room_height, air_abs=air_abs, max_order=max_order,
                           use_raytracer=use_raytracer, delay_sim=delay_sim, receiver_radius=receiver_radius,
