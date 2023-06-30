@@ -1648,6 +1648,7 @@ def create_dir_speaker_plot_objects(positions, dir_pattern, scale, color, name):
     colatitude_plot = np.linspace(start=0, stop=180, num=35, endpoint=True) #180
 
     dir_obj = []
+    legend = go.Scatter3d()
     for p in positions:
         x_offset = p[0]
         y_offset = p[1]
