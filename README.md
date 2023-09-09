@@ -3,3 +3,7 @@ This repository contains code for an acoustic simulation framework that can be u
 
 
 ![image](https://user-images.githubusercontent.com/44842230/236182468-6d1e57fa-4420-457a-9bc6-07ccd0ffea3e.png)
+
+# Publication
+Pre-print Arxiv: [Publisched framework](https://arxiv.org/abs/2305.02715)
+Accepted and presented at EUSIPCO2023
