@@ -24,6 +24,7 @@ import itertools
 import random
 import numba
 from numba import jit
+import tikzplotlib
 with open('config.json') as json_file:
     config = json.load(json_file)
 
@@ -367,20 +368,25 @@ def plot_audio_signal_and_envelope(title, signal, envelope, fs, dur_orig_sig, de
     plt.show()
 
 
-def plot_RIR(title, rir, fs):
+def plot_RIR(title, rir, fs, savename, max_x):
     """
     Show the RIR
     :param title: title of the plot
     :param rir: RIR
     :param fs: sampling frequency
     """
+    fig, ax = plt.subplots()
     max = np.argmax(rir)
-    plt.plot(rir)
+    plt.plot(np.arange(len(rir)) / fs, rir)
     plt.grid()
     plt.title(title)
-    plt.xlim([max-50, max+50])
+    plt.xlim([0, max_x])
     plt.ylabel('RIR')
     plt.xlabel('Time [s]')
+    image_format = 'svg'  # e.g .png, .svg, etc.
+    image_name = 'Sim_output_data\\svg_figures\\'+ savename +'.svg'
+    fig.savefig(image_name, format=image_format, dpi=1200)
+    tikzplotlib.save('Sim_output_data\\svg_figures\\'+ savename +'.tex', float_format=".5g")
     plt.show()
 
 # def plot_RIR(title, rir, fs):
