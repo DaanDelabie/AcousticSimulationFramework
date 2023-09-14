@@ -380,10 +380,6 @@ def sim_position(sim_nr, mic_locs, sp_locs, mic_dirs, sp_dirs, fs, fs_source, fs
     # Create the Room Impulse Response (RIR)
     #room.compute_rir()
 
-    if calc_rir:
-        # Measure the reverberation time
-        rt60_meas = room.measure_rt60()
-
     room.simulate(reference_mic=0)
 
     # #############################################################################################
@@ -398,7 +394,7 @@ def sim_position(sim_nr, mic_locs, sp_locs, mic_dirs, sp_dirs, fs, fs_source, fs
 
             # Plot the RIR between all mics and speakers
             if plot_rir:
-                lf.plot_RIR(title="RIR between the {}th mic and {}th source, simulation {}".format(m, s, sim_nr), rir=rir, fs=fs)
+                lf.plot_RIR(title="RIR between the {}th mic and {}th source, simulation {}".format(m, s, sim_nr), rir=rir, fs=fs,  savename='RIR_mic{}_speaker_{}_sim{}'.format(m,s, sim_nr), max_x=0.1)
 
             if save_rir:
                 np.save('RIRs/rir'+str(s)+'source'+str(m)+'mic'+'_simulation'+str(sim_nr)+'.npy', rir)
