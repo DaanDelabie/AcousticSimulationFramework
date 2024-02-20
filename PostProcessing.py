@@ -112,6 +112,8 @@ for sim_nr in tqdm(range(0, n_speakers)):
     ###############################################################
     # BPF
     # Here you can add a filter
+    if config['HPF']:
+        rx_mic_sig = lf.butter_highpass_filter(rx_mic_sig, 15000, fs_mic, 10)
 
     # Select wake-up part in received audio
     rx_audio_wake = lf.select_wakeup_part(fs_mic, chirp_orig_resampl, config['wake_up_duration'], rx_mic_sig)
