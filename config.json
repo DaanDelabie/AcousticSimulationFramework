@@ -44,6 +44,7 @@
    "sample_rate_RX": 192000,
    "absolute_corr": true,
    "LPF": true,
+   "HPF": true,
    "xor": false,
    "AGC": false,
    "peak_prominence": false,
