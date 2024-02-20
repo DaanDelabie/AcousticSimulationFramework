@@ -138,6 +138,7 @@ def setup():
                 anchor_pos_csv.append(pos_read_anchor)
 
         anchor_locs = np.array(anchor_pos_csv)
+        np.save('Sim_data\\anchor_positions.npy', anchor_locs)
 
     logger.info('Total amount of anchor node positions: {}'.format(np.size(anchor_locs, axis=0)))
     # Plot room with directivities
