@@ -5,7 +5,7 @@ This repository contains code for an acoustic simulation framework that can be u
 ![image](https://user-images.githubusercontent.com/44842230/236182468-6d1e57fa-4420-457a-9bc6-07ccd0ffea3e.png)
 
 # Publication
-Pre-print Arxiv: [Publisched framework](https://ieeexplore.ieee.org/document/10290120)
+Published work with more information: [Publisched framework](https://ieeexplore.ieee.org/document/10290120)
 Accepted and presented at EUSIPCO2023
 
 D. Delabie, C. Buyle, B. Cox, L. Van Der Perre and L. De Strycker, "An Acoustic Simulation Framework to Support Indoor Positioning and Data Driven Signal Processing Assessments," 2023 31st European Signal Processing Conference (EUSIPCO), Helsinki, Finland, 2023, pp. 261-265, doi: 10.23919/EUSIPCO58844.2023.10290120.
